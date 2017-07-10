@@ -1,0 +1,746 @@
+/*
+ReadMe:
+
+Assumptions:
+1. Motor & Rocket design guarantee to achieve higher altitude without airbrake control.
+2. Parachute size and throttle control knot guarantee to land on ground longer than target time without parachute control.
+3. 2nd phase ejection charge happened after apogee. To ensure this, we need to drill to precise delay time. 
+
+HW setup: 
+1. Electrical control board will load blink to show the power is applied.
+2. Red LED will blinking when power is applied which indicates serial port is active.
+3. Green LED will be off since Hall effect sensor detects nearby magnet. When rocket lands on ground green LED should be lit since magnet is away from Hall effect sensor. 
+4. SD card feature to enable field data accessment.
+   Chip select -- pin 0
+   SCLK -- pin 1
+   MOSI -- pin 2
+   MISO -- pin 3 
+
+SW setup:
+1. Load the latest software from PC before launch. 
+2. Software will stay in Teensy and loop the code whenever power is supplied. 
+
+Algorithm:
+
+1. Launch detect is designed to detect launch right after ignite. 
+2. We wait for about 2 seconds after motor complete burning to get the initial velocity for airbrake algorithm execution. 
+3. Execute airbrake algorithm to control servo to achieve target height.
+4. Eliminate Hall sensor and enforce linear actuator kick off to ensure capsule detach properly.
+5. Execute parachute algorithm to control linear actuator to achive target time. 
+6. Close linear actuator before landing on ground to protect device. 
+
+
+Note: 
+1. Baudrate: 9600 ==> 100mS Pnut altitude update speed. 
+2. TARC 2017 Regulations:
+     Qualification Target: 41-43s for 775ft.
+     National Target: 42-44s for 800ft. 
+3. All units used: feet, second. 
+4. Version_12: Hall Sensor Bypassed
+
+Note: major changes based on 08/21 data:
+
+1. Change target time to 42 - global offset = 41.3 second, 0.7s is default global offset.
+2. Set motor burn time to 2.7 sec since we will use Aerotech F35W-5, which has longer burn time (1.5 sec) . 
+3. Change time resolution from 0.4s to 0.1s to allow more correction.
+4. Change AltitudeJump from 100 ft to 10000 ft to disable jump/break function to save time for pc control.
+5. Change ABTuneThreshold from 50 to 30 to allow more correction. 
+6. Change apogeeThreshold to 650 feet as existing rocket design guarantees overshoot much higher than 650 feet. 
+
+Field try (10/23/16) experiments: (1) may need to increase "apogeeThreshold" to be larger than 650 ft so we can have more AB correction. If we can guarantee un-cal altitutde always be larger than 775 ft, 
+we can make this number much closer to our final target ft, namely, 775 ft. 
+
+
+Note: major changes based on 10/16 data:
+
+1. Make AB threshold hold time from 2ms to 20ms. 
+*/
+
+//00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000//
+// Note: In the field, we need to comment out all serial print (for debugging purpose) to save time
+//00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000//
+
+//********************************************************Setup*************************************************************
+                                          
+#include <Servo.h>
+#include <SD.h>                                     // SD card library
+#include <SD_t3.h>                                  // 
+
+Servo AirbrakeServo;
+
+#define desiredTime 42                              // 2017 TARC total fly time (in second)
+#define desiredAltitude 775.0                       // 2017 TARC target altitude (in feet)
+#define offsetTime 0.7                              // global time offset due to time spent during launch detection process. 
+
+#define ABdelayTime 10.0                            // delay time during airbrake cycling (in ms). 
+#define motorBurnTime 2.7                           // default 2.7 seconds, value can be changed depending on motor usage. (in second)
+#define LA_FullExtendTime 3000.0                    // default 4s for linear actuator full extension settling time. (in ms)
+#define ParachuteCoarseTuneDeltaTime 4.0            // Define parachute coarse tune time (unit=s). This means if delta time larger than this number, linear actuator needs to pull in full extension for fast response. 
+#define JumpBreakTime 500                           // During second phase ejection charge, delay 0.5 second (default)
+#define deltaTimeResolution 0.1                     // resolution must be less than 0.5 seconds to avoid errors rounding to 1 second
+#define ABThresholdTime 20                           // Airbrake Coarse Tune Threshold Hold Time (in ms)
+#define AltitudeJump 10000                          // large altitude jump noise (in feet) due to 2nd phase ejection charge.
+#define ABTuneThreshold 30                          // Airbrake Coarse Tune Threshold (in feet) to make sure faster converge. (note: default is 30, bypass for now, need study (08/06/16)
+#define apogeeThreshold 650                         // Minimum Altitude criteria (in feet) to qualify Apogee Detection. 
+#define minLaunchAltitude 50                        // Minimum Altitude criteria (in feet) to qualify launch Detection. 
+#define ABAltitudeResolution 0.5                    // Airbrake Fine Tune Resolution (in feet). 
+#define HS_Threshold 60                             // Hall Sensor Threshold Value.
+
+#define massRocket 650.0                            // Rocket total mass in grams.
+#define areaCrossSection 0.02681                    // Rocket cross setion in square feet June: for bt-70 tube - 2.217" outer diameter. 
+#define dragCoeff 0.8                               // drag coefficient
+#define temperature 25.0                            // temperature at launch in C.
+#define dewpoint 7.5                                // dew point in C.
+#define airpressure 1018.0                          // airpressure in hpa
+#define rho 32.46                                   // derived from 1.1471 kg/m^3 based on 35C, 1018 airpressure, 5 dew point. 
+#define gravity 32.174                              // define gravity in ft/s^2. 
+
+#define LedBlinkCounter 6                           //LED will blink 6 times in 2 seconds
+#define serialBaudRate 9600                         // set serial port speed
+#define maxReading 30000                            // Number of altitude entries in our table
+#define deployDetectPin 13                          // The launch detect sensor is connected to this pin
+#define AirbrakeCtrlPin 10                          //Teensy platform is 10
+#define ParachuteCtrlPin 12                         //Teensy platform is 12
+#define HallEffectSensorPin A1                      //Teensy platform is A1
+#define ledPin 11                                   // Teensy has LED on pin 11
+
+char pNutBuffer[10];                                // altitude string from pNut make sure this is large enough for the largest string it must hold (single altitude with CR and LF)
+
+static boolean LandDetectFlag = false;              //Flag sets once rocket land is dtected
+static boolean LaunchDetectFlag = false;            //Flag sets once rocket launch is detected
+static boolean AirbrakeDeployDetectFlag = false;    //Flag sets once airbrake deployment is detected
+static boolean ParachuteDeployDetectFlag = false;   //Flag sets once parachute deployment is detected
+static boolean CapsuleDetachDetectFlag = false;     //Flag sets once capsule deployment is detected
+static boolean ApogeeDetectFlag = false;            //Flag sets once rocket has reached apogee
+
+float startTime = 0.0;            
+float projectedTime = 0.0;
+float elapsedTime = 0.0;
+float projectedTotalFlightTime = 0.0;
+
+
+int InitPos_AirbrakeServo = 0;            // Set inital position of Airbrake Linear Actuator [0:255], 0 means no extension, 255 means 5cm?
+int InitPos_ParachuteLinearActuator = 0;         // Set inital position at middle of Parachute Linear Actuator [0:255], 0 means no extension, 255 means 10cm.
+int lastPos_ParachuteLinearActuator = 0;        // Set previous position of Parachute Linear Actuator. 
+
+int currentAltitude =0;                               // integer conversion of altitude string from pNut
+int thisAltitude = 0;                                 
+int lastAltitude = 0;
+int Altitude_1 = 0;                                   // 3 altitude for average in PC control.
+int Altitude_2 = 0;
+int Altitude_3 = 0;
+float currentRate_1 = 0.0;
+float currentRate_2 = 0.0;
+float currentRate_3 = 0.0;
+float lastTime = 0.0;                                    // Initialize time
+float currentRate=0.0;                                 // current rate could be ascending (airbrake) or descending (parashute ctrl)
+float lastRate=0.0;                                    // previous rate for accurate altitude prediction. 
+float deltaTime=0.0;                                   // Unit: seconds
+float ParachuteFineTuneRange=0.0;                      // Parachute range for linear actuator control
+
+int pNutValue = 0;                                     // Pnut altitude value. 
+
+File SDFile;                                          // Create data file for SD card. 
+
+//********************************************************************************************************************
+//************************************************Main Section*************************************************
+//********************************************************************************************************************
+void setup()
+{
+  pinMode(ledPin, OUTPUT);                          // Initialize digital pin as output
+  pinMode(deployDetectPin, INPUT);
+  Serial.begin(serialBaudRate);                                // Start serial port baud rate (1 bit/second)
+  Serial1.begin(serialBaudRate);                                // Start serial port baud rate (1 bit/second)
+  AirbrakeServo.attach(AirbrakeCtrlPin);
+  AirbrakeServo.write(0);
+  analogWrite(ParachuteCtrlPin, InitPos_ParachuteLinearActuator); //parachute linear actuator in starting position
+  LedBlink();      // Shows that power is up
+ 
+  Serial.println("Initialization the SD card..."); // SD card initalization process 
+  if (!SD.begin(0))                                
+  {
+    Serial.println("Initialization failed!");
+    return;
+  }
+  Serial.println("Initialization complete!");
+}
+
+void loop()
+{ 
+  if (LaunchDetectFlag == false) detectRocketLaunch();                    // wait for launch detect and start at t = 0
+  Serial.println("Rocket Launch Detected");
+  
+  SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+  if (SDFile)
+  {
+  SDFile.print("Rocket Launch Detected");
+  SDFile.close();
+  }
+  else
+  {
+    Serial.println("Error in opening the file!");
+  }
+  
+ 
+  getElapsedTime();   
+  if (elapsedTime > (motorBurnTime - offsetTime))
+  {   
+    for (int i = 0; i <=maxReading; i++)                                     //Reads altitude, time, and calculate descent rate         
+    {
+      detectApogee();                                                         // Consume 300ms to check Apogee flag & report currentRate.       
+      if (ApogeeDetectFlag == false)
+      { 
+        AirbrakeServoCtrl();                                                 // Turn on airbrake servo to control altitude, consume 350ms. 
+      }
+      else
+      {
+        if (CapsuleDetachDetectFlag == false)
+        {
+          analogWrite(ParachuteCtrlPin, 200);       // If the capsule has not yet detached and the rocket has begun descending, the parachute linear actuator will fully extend to push the capsule out. 
+          lastPos_ParachuteLinearActuator = 200;        // Saving existing postition for next run delay time calcuation.
+          delay(LA_FullExtendTime);                     // Delay 3 seconds for linear actuator full extension settling. 
+          CapsuleDetachDetectFlag = true;           // bypass Hall Effect, 08/06/16)
+
+Serial.println("&&&&  Pass Apogee, full extension of linear actuator to push off capsule!! &&&&");
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{
+  SDFile.println("&&&&  Pass Apogee, full extension of linear actuator to push off capsule!! &&&&");
+  SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}
+
+        }
+        else
+        {       
+          if (currentAltitude <= 4)                // Close linear actuator when altitude is less than 4 Feet from ground. 
+          {
+            analogWrite(ParachuteCtrlPin, 0);                               //close parachute linear actuator to protect device. 
+          }
+          else
+          {    
+            ParachuteCtrl();              // Turn on parachute linear actuator
+          }
+        }        
+      }
+
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{
+  SDFile.print("This is the line number:");
+  SDFile.println(i+1);
+  SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}
+
+Serial.print("This is line number:");                            //Print progress
+Serial.println(i+1);
+ 
+ 
+    } 
+  }
+    
+}
+//********************************************************************************************************************
+//******************************************************Function Section**********************************************
+//********************************************************************************************************************
+void LedBlink()
+{
+  int counter = 0;
+  while(counter<LedBlinkCounter)
+  {
+    digitalWrite(ledPin, HIGH);                                      //set LED on
+    delay(166);                                                      //wait for 1/6 seconds
+    digitalWrite(ledPin, LOW);                                       //set LED off
+    delay(166);                                                      //wait for 1/6 seconds
+    counter++;
+  }
+}
+
+bool detectRocketLaunch()                                         // Function to detect launch - when launch is detected, the launchDetectFlag is set to true
+{
+  int launchDetectCount = 0;
+  long unsigned nowTime=0;
+
+  while (launchDetectCount < 3)
+  {
+    getPnutAltitude();
+    thisAltitude = currentAltitude;
+
+    if ((thisAltitude > lastAltitude) && (LaunchDetectFlag == false) && (thisAltitude > minLaunchAltitude))  
+    {
+      launchDetectCount++;
+    }
+    else if (LaunchDetectFlag == false)
+    {
+      launchDetectCount = 0;
+    }
+    lastAltitude = thisAltitude;
+  }
+  startTime = millis()/1000.0 - 0.3;                            // substrate out initial 3*50ms delay time for launch detect decision. 
+  LaunchDetectFlag = true;
+  
+Serial.print("startTime:");
+Serial.println(startTime);
+
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{
+  SDFile.print("startTime:");
+  SDFile.println(startTime);
+  SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}
+
+  return LaunchDetectFlag;
+  
+}
+
+void getElapsedTime()
+{
+  elapsedTime = millis()/1000.0 - startTime;              //eliminate debugging delay time in seconds
+
+Serial.print(">>>>> elapsed time: ");
+Serial.println(elapsedTime);
+
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{
+  SDFile.print(">>>>> elapsed time:");
+  SDFile.println(elapsedTime);
+  SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}
+
+
+}
+
+bool detectApogee()           // detect when the rocket has reached its maximum altitude and cut out the anomalies
+{
+  int i = 0;
+  int looptime = 0;
+  int apogeeDetectCount = 0;
+  int dAltitude = 0;
+  float thisTime = 0.0;
+  float dTime=0.0;
+  
+  getPnutAltitude();               //Return currentAltitude
+  if ((currentAltitude > apogeeThreshold) || (ApogeeDetectFlag == true))
+  { 
+    looptime = 3;            // more loop time for parachute control 
+  }
+  else
+  {
+    looptime = 1;            // only one time for airbrake control so we can have more correction times. 
+  }
+   
+  while (i < looptime)
+  {     
+    getElapsedTime();                // Return elapaseTime
+    if (looptime > 1)
+    {
+      getPnutAltitude();               //Return currentAltitude
+    }
+    dAltitude= abs(lastAltitude-currentAltitude);
+    dTime=elapsedTime-lastTime;
+    lastRate=currentRate;                     // store the previous rate
+    currentRate = dAltitude /dTime;              // feet per second     
+    thisAltitude = currentAltitude;
+
+    if ((abs(lastAltitude - thisAltitude) >= AltitudeJump) && (ApogeeDetectFlag == true))  // large altitude jump due to 2nd phase ejection charge which 
+    {                                                       // creates unuseable altitude reading, need to skip 1 second. 
+      lastAltitude = thisAltitude;
+      delay(JumpBreakTime);
+
+Serial.println("+++++++ Inside DetectApogee big Altitude Jump, and break ! ");
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{
+  SDFile.println("+++++++ Inside DetectApogee big Altitude Jump, and break ! ");
+  SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}
+
+      break; 
+    }
+    
+    if (i == 0)
+    {
+      Altitude_1 = currentAltitude;
+      currentRate_1=currentRate;
+    }
+    if (i == 1)
+    {
+      Altitude_2 = currentAltitude;
+      currentRate_2=currentRate;
+    }
+    if (i == 2)
+    {
+      Altitude_3 = currentAltitude;
+      currentRate_3=currentRate;
+    }
+
+    if ((lastAltitude - thisAltitude) >= 1) 
+    {
+      apogeeDetectCount++;      
+    }
+    else
+    {
+      apogeeDetectCount = 0;      
+    }        
+    lastAltitude = thisAltitude;
+    lastTime=elapsedTime; 
+    i++;    
+  }
+
+
+  if ((apogeeDetectCount >= 2) && (thisAltitude >= apogeeThreshold))      // default apogeeThreshold = 500 feet. 
+  {
+    ApogeeDetectFlag = true;    
+  } 
+ 
+Serial.print("++++ ApogeeDetectFlag: ");
+Serial.println(ApogeeDetectFlag); 
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{
+  SDFile.print("++++ ApogeeDetectFlag:");
+  SDFile.println(ApogeeDetectFlag);
+  SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}
+ 
+   
+  return ApogeeDetectFlag;
+}
+
+void getPnutAltitude()                                                         // function to get altitude
+{
+  int byteRead;
+  int i = 0;
+  int j = 0;
+  
+  Serial1.begin(serialBaudRate);                                                              //open serial point and set baud rate to 19200 bits per second
+  while (Serial1.available() == 0);                                                //check if serial port is open
+  
+  while (j<10000)
+  {
+    byteRead = Serial1.read();
+    
+    if (byteRead == -1) continue;                                                   //if no characters are in the buffer read() returns -1
+    if (byteRead == '\r') continue; 
+    if (byteRead == '\n') break;                                                    //found line feed and break while loop
+    j++;                                                                            //j loop avoids partial altitude readings   
+  } 
+    pNutValue = 0;                                                               //throw away previous pNut value
+    while(i<10000)                                                                    //convert ASCII to integer, add, and shift left 1 decimal place   
+    {
+      byteRead = Serial1.read();
+      if (byteRead == -1) continue;                                              // if no characters in buffer read() returns -1
+      if (byteRead == ',') break;
+      if (byteRead == '\r') continue;                                                //found carriage return; continue to next while loop
+      if (byteRead == '\n') break;                                                // found line feed
+      pNutValue *= 10;                                                            //shift left 1 decimal place
+      pNutValue = pNutValue + (byteRead-'0');
+      i++;
+    }
+    Serial1.end();                                                              //close serial port
+    currentAltitude = pNutValue;
+
+  
+Serial.print(" ------------------------------------  Pnut Altitude: ");
+Serial.println(currentAltitude);
+
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{
+  SDFile.print(" ----------------------------------  Pnut Altitude: ");
+  SDFile.println(currentAltitude);
+  SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}
+
+  
+}
+
+void AirbrakeServoCtrl()
+{
+  float projectedAltitude = 0.0;
+  float kk=0.0;
+  float factor1=0.0;
+  double factor2=0.0;
+  int pos=0;
+  int pos_tune=0;
+  
+  /*
+  kk=0.5*dragCoeff*rho*areaCrossSection;          // k factor in airbrake velocity calcuation. 
+
+  factor1=massRocket/(2.0*kk);
+  factor2=kk/float(massRocket*gravity);      
+  projectedAltitude = currentAltitude + factor1*log(1+factor2*currentRate*currentRate); // projected Altitude based on newton's 2nd law with air friction.
+ */
+ 
+
+  projectedAltitude = currentAltitude + 0.5*(currentRate*currentRate)/gravity;
+ 
+Serial.print("%%%%%%  Airbrake Servo Control: projectedAltitude= ");
+Serial.println(projectedAltitude);
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{  
+ SDFile.print("%%%%%%  Airbrake Servo Control: projectedAltitude= ");
+ SDFile.println(projectedAltitude);
+ SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}
+
+  if ((projectedAltitude - desiredAltitude) >= ABTuneThreshold)   // default ABTuneThreshold = 50 feet. 
+  {
+    for (pos = 0; pos <= 90; pos +=5) 
+      {           
+        AirbrakeServo.write(pos);
+        delay(ABdelayTime);
+      }
+    delay(ABThresholdTime);                                       // default ABThreshouldTime = 0.3 seconds. 
+    for (pos = 90; pos >= 0; pos -=5) 
+      {
+        AirbrakeServo.write(pos);
+        delay(ABdelayTime);
+      }      
+ 
+Serial.println("%%%%% inside AirbrakeServoCtrl Coarse Tune, keep open for 0.3s %%%%%%");
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{  
+ SDFile.println("%%%%% inside AirbrakeServoCtrl Coarse Tune, keep open for 0.3s %%%%%%");
+ SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}
+         
+  }
+  else                    
+  {
+    if (projectedAltitude > (desiredAltitude + ABAltitudeResolution))        // This if statement consumes 350ms. ABAltitudeResolution = 0.5 ft.
+    {
+      
+      pos_tune = 90 * (projectedAltitude - desiredAltitude)/ABTuneThreshold;
+      for (pos = 0; pos <= pos_tune; pos +=5) 
+      {           
+        AirbrakeServo.write(pos);
+        delay(ABdelayTime);
+      }
+      for (pos = pos_tune; pos >= 0; pos -=5) 
+      {
+        AirbrakeServo.write(pos);
+        delay(ABdelayTime);
+      }
+
+Serial.print("%%%%% inside AirbrakeServoCtrl Fine Tune, pos_tune = ");
+Serial.println(pos_tune);
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{  
+ SDFile.print("%%%%% inside AirbrakeServoCtrl Fine Tune, pos_tune = ");
+ SDFile.println(pos_tune);
+ SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}
+
+
+      
+    }
+    else
+    {
+     AirbrakeServo.write(0); 
+     
+Serial.println("%%%%% inside AirbrakeServoCtrl No Tune %%%%%%");     
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{  
+ SDFile.println("%%%%% inside AirbrakeServoCtrl No Tune %%%%%%");
+ SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}     
+     
+     
+     
+    }
+  }  
+}  
+
+void ParachuteCtrl()
+{
+  int Pos_ParachuteLinearActuator;                                           //Parachute linear actuator extension position [1: 255]
+  int delta_Pos;
+  float avg_Altitude=0;
+  float avg_Rate=0;
+  float i =0;
+
+/*
+  avg_Altitude=(Altitude_1 + Altitude_2 + Altitude_3)/3;
+  avg_Rate=(currentRate_1 + currentRate_2 + currentRate_3)/3;
+*/
+  avg_Altitude=(Altitude_1 + Altitude_3)/2;
+  avg_Rate=(currentRate_1 + currentRate_3)/2;
+
+
+  projectedTime = avg_Altitude/avg_Rate;                          // calculate projected descending time for rocket land. (assume linear equation)
+  projectedTotalFlightTime = projectedTime + elapsedTime;          //calculate time for rocket to land on ground
+  deltaTime = projectedTotalFlightTime - (desiredTime-offsetTime);              //calculate delta time between projected time and desired time
+
+  if(deltaTime > ParachuteCoarseTuneDeltaTime)                    // Default ParachuteCoarseTuneDeltaTime = 4s. 
+  {
+    Pos_ParachuteLinearActuator = 200;                           // too slow; contract linear actuator
+
+Serial.println("&&&&&  Parachute Control: too slow need full extension &&&&&&&");
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{  
+ SDFile.println("&&&&&  Parachute Control: too slow need full extension &&&&&&&");
+ SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}
+
+  }
+  else if (deltaTime > deltaTimeResolution)                     // not so slow (default time resolution = 0.1s)
+  {
+    Pos_ParachuteLinearActuator = 200 * deltaTime/ParachuteCoarseTuneDeltaTime;  // fine tune position of linear actuator when delta time within coarse time range
+
+Serial.println("&&&&&   kind of slow..., fine tune position");
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{  
+ SDFile.println("&&&&&  kind of slow..., fine tune position");
+ SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}
+
+  }
+  else
+  {
+    Pos_ParachuteLinearActuator = 0;  // fine tune position of linear actuator when delta time within coarse time range
+
+Serial.println("&&&&& too fast or almost right on, no extension");
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{  
+ SDFile.println("&&&&&  too fast or almost right on, no extension");
+ SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}
+
+  }
+
+  analogWrite(ParachuteCtrlPin, Pos_ParachuteLinearActuator);
+  delta_Pos = abs(Pos_ParachuteLinearActuator - lastPos_ParachuteLinearActuator); // find out delta pos between this time and last time to make sure no overhead of delay time. (10/15/16)
+  delay(LA_FullExtendTime*delta_Pos/200);                             // Delay enough time for full settling. Default full extension is 3 seconds.  
+  lastPos_ParachuteLinearActuator=Pos_ParachuteLinearActuator;        // Saving existing postition for next run delay time calcuation.
+
+
+Serial.print("projectedTotalFlightTime(s):");
+Serial.println(projectedTotalFlightTime);
+Serial.print("Parachute Linear Actuator Position:");
+Serial.println(Pos_ParachuteLinearActuator);  
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{  
+  SDFile.print("projectedTotalFlightTime(s):");
+  SDFile.println(projectedTotalFlightTime);
+  SDFile.print("Parachute Linear Actuator Position:");
+  SDFile.println(Pos_ParachuteLinearActuator);
+  SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}
+  
+}
+
+
+//*********************************************************
+//*********************************************************
+
+
+bool detectCapsuleDetach()                                           // Function to detect parachute deployment - when deployment is detected the deployDetectFlag is set to true
+{
+  int i = 0;
+  int sensorValue;
+  int Capsule_detachDetectCount = 0;
+
+  while (i < 3)    
+  {
+    sensorValue = analogRead(HallEffectSensorPin);    
+    if (sensorValue > HS_Threshold) 
+    {
+      Capsule_detachDetectCount++;                        //Bigger than 150 means that the capsule is separated from the hall effect sensor
+    }
+    else
+    {
+      Capsule_detachDetectCount = 0;
+    }
+    i++;  
+   }
+   
+  if (Capsule_detachDetectCount >= 2) CapsuleDetachDetectFlag = true;
+ 
+Serial.print("++++  CapsuleDetachDetectFlag: ");
+Serial.println(CapsuleDetachDetectFlag); 
+SDFile = SD.open("TARC.txt", FILE_WRITE);                    // Open the SD File for Write
+if (SDFile)
+{
+  SDFile.print("++++  CapsuleDetachDetectFlag: ");
+  SDFile.println(CapsuleDetachDetectFlag);
+  SDFile.close();
+}
+else
+{
+  Serial.println("Error in opening the file!");
+}
+ 
+ 
+  return CapsuleDetachDetectFlag;
+}
+
